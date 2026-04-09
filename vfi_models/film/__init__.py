@@ -65,7 +65,10 @@ class _FilmModelRunner:
                 eager = torch.compile(eager, dynamic=False)
                 print("FILM VFI: compiled eager fallback enabled")
             except Exception as exc:
-                print(f"FILM VFI: eager fallback compile skipped: {exc}")
+                print(
+                    f"FILM VFI: eager fallback compile skipped "
+                    f"({type(exc).__name__}): {exc}"
+                )
 
         self._eager_model = eager
         return eager
