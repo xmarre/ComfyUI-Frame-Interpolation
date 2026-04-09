@@ -1,3 +1,4 @@
+import os
 import torch
 from comfy.model_management import get_torch_device, soft_empty_cache
 import bisect
@@ -7,8 +8,84 @@ from vfi_utils import InterpolationStateList, load_file_from_github_release, pre
 import pathlib
 import gc
 
+from .film_arch import Interpolator
+
 MODEL_TYPE = pathlib.Path(__file__).parent.name
 DEVICE = get_torch_device()
+
+_ALIAS_ANALYSIS_ERROR_SNIPPETS = (
+    "alias_analysis.cpp",
+    "Types must be strictly equal if you are replacing aliasing information",
+)
+
+
+def _is_jit_alias_analysis_failure(exc: RuntimeError) -> bool:
+    msg = str(exc)
+    return all(snippet in msg for snippet in _ALIAS_ANALYSIS_ERROR_SNIPPETS)
+
+
+class _FilmModelRunner:
+    """
+    Prefer the existing TorchScript path when it works.
+    If the current PyTorch JIT trips the known alias-analysis internal assert,
+    rebuild the same FILM weights into the eager Interpolator implementation and
+    continue with that backend for the rest of the run.
+    """
+
+    def __init__(self, model_path: str):
+        self._script_model = torch.jit.load(model_path, map_location="cpu")
+        self._script_model.eval()
+        self._cpu_state_dict = {
+            key: value.detach().cpu()
+            for key, value in self._script_model.state_dict().items()
+        }
+        self._script_model = self._script_model.to(DEVICE)
+        self._eager_model = None
+
+    def _build_eager_model(self):
+        eager = Interpolator()
+        eager.load_state_dict(self._cpu_state_dict, strict=True)
+        eager.eval()
+
+        self._cpu_state_dict = None
+
+        old_script_model = self._script_model
+        self._script_model = None
+        del old_script_model
+        gc.collect()
+        soft_empty_cache()
+
+        eager = eager.to(DEVICE)
+
+        compile_eager = os.environ.get("COMFYUI_FILM_COMPILE_EAGER", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if compile_eager and hasattr(torch, "compile"):
+            try:
+                eager = torch.compile(eager, dynamic=False)
+                print("FILM VFI: compiled eager fallback enabled")
+            except Exception as exc:
+                print(
+                    f"FILM VFI: eager fallback compile skipped "
+                    f"({type(exc).__name__}): {exc}"
+                )
+
+        self._eager_model = eager
+        return eager
+
+    def __call__(self, x0, x1, dt):
+        if self._eager_model is not None:
+            return self._eager_model(x0, x1, dt)
+
+        try:
+            return self._script_model(x0, x1, dt)
+        except RuntimeError as exc:
+            if not _is_jit_alias_analysis_failure(exc):
+                raise
+            print("FILM VFI: TorchScript alias-analysis crash detected; switching to eager FILM backend for this run.")
+            return self._build_eager_model()(x0, x1, dt)
+
+
 def inference(model, img_batch_1, img_batch_2, inter_frames):
     results = [
         img_batch_1,
@@ -71,10 +148,7 @@ class FILM_VFI:
     ):
         interpolation_states = optional_interpolation_states
         model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
-        model = torch.jit.load(model_path, map_location='cpu')
-        model.eval()
-        model = model.to(DEVICE)
-        dtype = torch.float32
+        model = _FilmModelRunner(model_path)
 
         frames = preprocess_frames(frames)
         number_of_frames_processed_since_last_cleared_cuda_cache = 0
@@ -92,7 +166,7 @@ class FILM_VFI:
             frame_0 = frames[frame_itr:frame_itr+1].to(DEVICE).float()
             frame_1 = frames[frame_itr+1:frame_itr+2].to(DEVICE).float()
             relust = inference(model, frame_0, frame_1, multipliers[frame_itr] - 1)
-            output_frames.extend([frame.detach().cpu().to(dtype=dtype) for frame in relust[:-1]])
+            output_frames.extend([frame.detach().cpu().to(dtype=torch.float32) for frame in relust[:-1]])
 
             number_of_frames_processed_since_last_cleared_cuda_cache += 1
             # Try to avoid a memory overflow by clearing cuda cache regularly
@@ -103,7 +177,7 @@ class FILM_VFI:
                 print("Done cache clearing")
             gc.collect()
         
-        output_frames.append(frames[-1:].to(dtype=dtype)) # Append final frame
+        output_frames.append(frames[-1:].to(dtype=torch.float32)) # Append final frame
         output_frames = [frame.cpu() for frame in output_frames] #Ensure all frames are in cpu
         out = torch.cat(output_frames, dim=0)
         # clear cache for courtesy
